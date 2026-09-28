@@ -46,7 +46,7 @@ jobs:
         run: |
           git clone https://github.com/tashfeenahmed/freellmapi.git /tmp/freellmapi
           cd /tmp/freellmapi
-          npm ci
+          npm install
           npm run build
 
       - name: Start FreeLLMAPI
@@ -105,7 +105,7 @@ jobs:
         run: |
           pip install faster-whisper
           
-          cat >> ~/.hermes/config.yaml << 'EOF'
+          cat > ~/.hermes/config.yaml << 'EOF'
           stt:
             enabled: true
             provider: local
@@ -118,7 +118,7 @@ jobs:
         run: |
           mkdir -p ~/.hermes/gateways/telegram
           
-          cat > ~/.hermes/gateways/telegram/config.yaml << EOF
+          cat > ~/.hermes/gateways/telegram/config.yaml << 'EOF'
           gateway:
             platform: telegram
             token: "${TELEGRAM_BOT_TOKEN}"
