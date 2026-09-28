@@ -1,0 +1,52 @@
+# Secrets and credentials
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Provider keys
+provider_keys.json
+freellmapi_keys*.json
+freellmapi.config.json
+
+# Hermes home directory
+~/.hermes/
+$HERMES_HOME/
+
+# FreeLLMAPI data
+/tmp/freellmapi/
+/tmp/freellmapi.log
+/tmp/freellmapi.config.json
+/tmp/hermes-gateway.log
+/tmp/test_audio.wav
+/tmp/test.pdf
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*

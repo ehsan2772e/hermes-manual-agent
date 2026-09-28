@@ -1,0 +1,279 @@
+name: manual-agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run self-tests instead of waiting for Telegram message'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  manual-agent:
+    name: Hermes Agent + FreeLLMAPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Hermes Agent
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+          echo "$HOME/.hermes/bin" >> $GITHUB_PATH
+
+      - name: Clone and build FreeLLMAPI
+        run: |
+          git clone https://github.com/tashfeenahmed/freellmapi.git /tmp/freellmapi
+          cd /tmp/freellmapi
+          npm ci
+          npm run build
+
+      - name: Start FreeLLMAPI
+        id: freellmapi
+        env:
+          FREEAPI_CONFIG_JSON: ${{ secrets.FREEAPI_CONFIG_JSON }}
+          ENCRYPTION_KEY: ${{ secrets.FREELLMAPI_ENCRYPTION_KEY }}
+        run: |
+          if [ -z "$ENCRYPTION_KEY" ]; then
+            ENCRYPTION_KEY=$(openssl rand -hex 32)
+            echo "Generated ENCRYPTION_KEY: $ENCRYPTION_KEY"
+          fi
+          export ENCRYPTION_KEY
+          export PORT=3001
+          export HOST=0.0.0.0
+          export NODE_ENV=production
+          
+          echo "$FREEAPI_CONFIG_JSON" > /tmp/freellmapi.config.json
+          export FREEAPI_CONFIG_PATH=/tmp/freellmapi.config.json
+          
+          cd /tmp/freellmapi
+          node server/dist/index.js > /tmp/freellmapi.log 2>&1 &
+          FREEAPI_PID=$!
+          echo "FREEAPI_PID=$FREEAPI_PID" >> $GITHUB_ENV
+          
+          echo "Waiting for FreeLLMAPI to be healthy..."
+          for i in {1..180}; do
+            if curl -sf http://localhost:3001/api/ping > /dev/null 2>&1; then
+              echo "FreeLLMAPI is healthy!"
+              break
+            fi
+            if [ $i -eq 180 ]; then
+              echo "FreeLLMAPI failed to start within 3 minutes"
+              cat /tmp/freellmapi.log
+              exit 1
+            fi
+            sleep 1
+          done
+          
+          UNIFIED_KEY=$(sqlite3 /tmp/freellmapi/server/data/freeapi.db "SELECT value FROM settings WHERE key = 'unified_api_key';")
+          if [ -z "$UNIFIED_KEY" ]; then
+            echo "Could not read unified API key from FreeLLMAPI database"
+            exit 1
+          fi
+          echo "FREELLMAPI_UNIFIED_KEY=$UNIFIED_KEY" >> $GITHUB_ENV
+          echo "Unified key retrieved successfully"
+
+      - name: Configure Hermes with FreeLLMAPI
+        env:
+          FREELLMAPI_UNIFIED_KEY: ${{ env.FREELLMAPI_UNIFIED_KEY }}
+        run: |
+          cd /tmp/freellmapi
+          npx freellmapi setup-hermes --url http://localhost:3001 --api-key "$FREELLMAPI_UNIFIED_KEY"
+          
+      - name: Enable local STT
+        run: |
+          pip install faster-whisper
+          
+          cat >> ~/.hermes/config.yaml << 'EOF'
+
+stt:
+  enabled: true
+  provider: local
+EOF
+
+      - name: Configure Telegram gateway
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_ALLOWED_USERS }}
+        run: |
+          mkdir -p ~/.hermes/gateways/telegram
+          
+          cat > ~/.hermes/gateways/telegram/config.yaml << EOF
+gateway:
+  platform: telegram
+  token: "${TELEGRAM_BOT_TOKEN}"
+  allowed_users:
+    - ${TELEGRAM_ALLOWED_USERS}
+  mode: polling
+  polling_interval_ms: 1000
+EOF
+
+      - name: Start Hermes Telegram gateway
+        run: |
+          hermes gateway start telegram > /tmp/hermes-gateway.log 2>&1 &
+          HERMES_PID=$!
+          echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
+          
+          echo "Waiting for Hermes gateway to start..."
+          sleep 5
+          if ! ps -p $HERMES_PID > /dev/null; then
+            echo "Hermes gateway failed to start"
+            cat /tmp/hermes-gateway.log
+            exit 1
+          fi
+          echo "Hermes gateway started (PID: $HERMES_PID)"
+
+      - name: Run tests or wait for voice message
+        id: process
+        env:
+          TEST_MODE: ${{ github.event.inputs.test_mode }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HERMES_PID: ${{ env.HERMES_PID }}
+        run: |
+          if [ "$TEST_MODE" = "true" ]; then
+            echo "Running test mode..."
+            
+            echo "TEST 1: FreeLLMAPI connectivity - PASS"
+            
+            echo "Running TEST 2: Model connectivity..."
+            RESPONSE=$(hermes chat -q 'reply with the single word "ok"' 2>&1)
+            if echo "$RESPONSE" | grep -qi "ok"; then
+              echo "TEST 2: Model connectivity - PASS"
+            else
+              echo "TEST 2: Model connectivity - FAIL"
+              echo "Response: $RESPONSE"
+              exit 1
+            fi
+            
+            echo "Running TEST 3: STT connectivity..."
+            espeak -w /tmp/test_audio.wav "test transcription" 2>/dev/null || \
+              (apt-get update && apt-get install -y espeak && espeak -w /tmp/test_audio.wav "test transcription")
+            
+            STT_OUTPUT=$(hermes stt /tmp/test_audio.wav 2>&1)
+            if echo "$STT_OUTPUT" | grep -qi "test\|transcription"; then
+              echo "TEST 3: STT connectivity - PASS"
+            else
+              echo "TEST 3: STT connectivity - FAIL"
+              echo "STT Output: $STT_OUTPUT"
+              exit 1
+            fi
+            
+            echo "Running TEST 4: Telegram file send..."
+            pip install fpdf2 >/dev/null 2>&1
+            python3 -c "
+from fpdf import FPDF
+pdf = FPDF()
+pdf.add_page()
+pdf.set_font('Helvetica', size=12)
+pdf.cell(0, 10, 'Test PDF from Hermes Manual Agent', ln=True)
+pdf.output('/tmp/test.pdf')
+"
+            
+            if [ -f /tmp/test.pdf ]; then
+              echo "TEST 4: Test PDF created - PASS"
+            else
+              echo "TEST 4: Test PDF creation - FAIL"
+              exit 1
+            fi
+            
+            echo "Running TEST 5: Secret leakage scan..."
+            if git diff --name-only | grep -qE '\.env$|\.json$|provider.*key|secret|token|password'; then
+              echo "TEST 5: Secret leakage scan - FAIL (potential secret files staged)"
+              git diff --name-only
+              exit 1
+            fi
+            if git status --porcelain | grep -qE '\.env$|\.json$|provider.*key|secret|token|password'; then
+              echo "TEST 5: Secret leakage scan - FAIL (potential secret files in status)"
+              git status --porcelain
+              exit 1
+            fi
+            echo "TEST 5: Secret leakage scan - PASS"
+            
+            echo "All tests passed!"
+            
+          else
+            echo "Waiting for voice message on Telegram (10 minute timeout)..."
+            echo "Send a voice note to your bot now."
+            
+            for i in {1..600}; do
+              if ! ps -p $HERMES_PID > /dev/null; then
+                echo "Hermes gateway process died"
+                cat /tmp/hermes-gateway.log
+                exit 1
+              fi
+              
+              if [ $((i % 60)) -eq 0 ]; then
+                echo "Still waiting... ($((600-i)) seconds remaining)"
+              fi
+              sleep 1
+            done
+            
+            echo "Timeout: No voice message received within 10 minutes"
+            exit 0
+          fi
+
+      - name: Send test PDF to Telegram
+        if: github.event.inputs.test_mode == 'true'
+        uses: cbrgm/telegram-github-action@v1
+        with:
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          document: /tmp/test.pdf
+          media-type: document
+          caption: "Test PDF from Hermes Manual Agent (test mode)"
+
+      - name: Cleanup processes
+        if: always()
+        run: |
+          if [ -n "$HERMES_PID" ] && ps -p $HERMES_PID > /dev/null; then
+            kill $HERMES_PID 2>/dev/null || true
+            echo "Stopped Hermes gateway (PID: $HERMES_PID)"
+          fi
+          
+          if [ -n "$FREEAPI_PID" ] && ps -p $FREEAPI_PID > /dev/null; then
+            kill $FREEAPI_PID 2>/dev/null || true
+            echo "Stopped FreeLLMAPI (PID: $FREEAPI_PID)"
+          fi
+
+      - name: Secret leakage scan
+        if: always()
+        run: |
+          echo "Scanning for potential secret leakage..."
+          
+          if git diff --name-only | grep -qE '\.env$|provider_keys\.json$|freellmapi_keys.*\.json$|\.key$|\.pem$|\.p12$|\.pfx$'; then
+            echo "Potential secret files in git diff:"
+            git diff --name-only | grep -E '\.env$|provider_keys\.json$|freellmapi_keys.*\.json$|\.key$|\.pem$|\.p12$|\.pfx$'
+            exit 1
+          fi
+          
+          if git status --porcelain | grep -qE '\.env$|provider_keys\.json$|freellmapi_keys.*\.json$|\.key$|\.pem$|\.p12$|\.pfx$'; then
+            echo "Potential secret files in git status:"
+            git status --porcelain | grep -E '\.env$|provider_keys\.json$|freellmapi_keys.*\.json$|\.key$|\.pem$|\.p12$|\.pfx$'
+            exit 1
+          fi
+          
+          if git diff --name-only | xargs -r grep -lE '(sk-|gsk_|AIza|ghp_|gho_|ghu_|ghs_|ghr_|xoxb-|xoxp-|xoxa-|xoxo-|bot[0-9]+:|Bearer\s+[A-Za-z0-9_-]{20,})' 2>/dev/null; then
+            echo "Potential API keys found in staged changes"
+            exit 1
+          fi
+          
+          echo "No secret leakage detected"
