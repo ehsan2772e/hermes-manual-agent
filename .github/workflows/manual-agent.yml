@@ -9,6 +9,9 @@ on:
         default: false
         required: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: read
 
@@ -103,11 +106,10 @@ jobs:
           pip install faster-whisper
           
           cat >> ~/.hermes/config.yaml << 'EOF'
-
-stt:
-  enabled: true
-  provider: local
-EOF
+          stt:
+            enabled: true
+            provider: local
+          EOF
 
       - name: Configure Telegram gateway
         env:
@@ -117,14 +119,14 @@ EOF
           mkdir -p ~/.hermes/gateways/telegram
           
           cat > ~/.hermes/gateways/telegram/config.yaml << EOF
-gateway:
-  platform: telegram
-  token: "${TELEGRAM_BOT_TOKEN}"
-  allowed_users:
-    - ${TELEGRAM_ALLOWED_USERS}
-  mode: polling
-  polling_interval_ms: 1000
-EOF
+          gateway:
+            platform: telegram
+            token: "${TELEGRAM_BOT_TOKEN}"
+            allowed_users:
+              - ${TELEGRAM_ALLOWED_USERS}
+            mode: polling
+            polling_interval_ms: 1000
+          EOF
 
       - name: Start Hermes Telegram gateway
         run: |
@@ -179,14 +181,7 @@ EOF
             
             echo "Running TEST 4: Telegram file send..."
             pip install fpdf2 >/dev/null 2>&1
-            python3 -c "
-from fpdf import FPDF
-pdf = FPDF()
-pdf.add_page()
-pdf.set_font('Helvetica', size=12)
-pdf.cell(0, 10, 'Test PDF from Hermes Manual Agent', ln=True)
-pdf.output('/tmp/test.pdf')
-"
+            python3 -c "from fpdf import FPDF; pdf = FPDF(); pdf.add_page(); pdf.set_font('Helvetica', size=12); pdf.cell(0, 10, 'Test PDF from Hermes Manual Agent', ln=True); pdf.output('/tmp/test.pdf')"
             
             if [ -f /tmp/test.pdf ]; then
               echo "TEST 4: Test PDF created - PASS"
